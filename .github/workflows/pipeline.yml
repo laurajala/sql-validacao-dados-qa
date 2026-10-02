@@ -1,0 +1,92 @@
+name: SQL Validations
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  validacoes:
+    name: Validações de dados
+    runs-on: ubuntu-latest
+
+    env:
+      # Senha de um banco temporário, criado e descartado a cada execução
+      SA_PASSWORD: 'QaPipeline#2026'
+      SQLCMD: /opt/mssql-tools18/bin/sqlcmd
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: 'Y'
+          MSSQL_SA_PASSWORD: 'QaPipeline#2026'
+        ports:
+          - 1433:1433
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v7
+
+      - name: Aguardar o SQL Server ficar disponível
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec ${{ job.services.sqlserver.id }} $SQLCMD -S localhost -U sa -P "$SA_PASSWORD" -C -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server disponível."
+              exit 0
+            fi
+            echo "Aguardando o SQL Server... ($i/30)"
+            sleep 5
+          done
+          echo "O SQL Server não respondeu a tempo."
+          exit 1
+
+      - name: Copiar scripts para o container
+        run: |
+          docker exec ${{ job.services.sqlserver.id }} mkdir -p /tmp/projeto
+          docker cp database ${{ job.services.sqlserver.id }}:/tmp/projeto/database
+          docker cp validacoes ${{ job.services.sqlserver.id }}:/tmp/projeto/validacoes
+
+      - name: Criar estrutura do banco
+        run: docker exec ${{ job.services.sqlserver.id }} $SQLCMD -S localhost -U sa -P "$SA_PASSWORD" -C -b -f 65001 -i /tmp/projeto/database/01_schema.sql
+
+      - name: Carregar massa de dados
+        run: docker exec ${{ job.services.sqlserver.id }} $SQLCMD -S localhost -U sa -P "$SA_PASSWORD" -C -b -f 65001 -i /tmp/projeto/database/02_massa_de_dados.sql
+
+      - name: Executar validações e gerar relatório
+        run: |
+          echo "## Resultado das validações de dados" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Validação | Registros inconsistentes |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | ---: |" >> "$GITHUB_STEP_SUMMARY"
+
+          total=0
+          for arquivo in validacoes/*.sql; do
+            nome=$(basename "$arquivo" .sql)
+            saida=$(docker exec ${{ job.services.sqlserver.id }} $SQLCMD -S localhost -U sa -P "$SA_PASSWORD" -C -b -f 65001 -d PagamentosQA -W -s " | " -i "/tmp/projeto/$arquivo")
+            linhas=$(echo "$saida" | grep -oP '\(\K[0-9]+(?= rows? affected\))' | tail -1 || true)
+            linhas=${linhas:-0}
+            total=$((total + linhas))
+
+            echo "| $nome | $linhas |" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### $nome"
+              echo '```text'
+              echo "$saida"
+              echo '```'
+            } >> detalhes.md
+
+            echo "===== $nome: $linhas registro(s) inconsistente(s)"
+            echo "$saida"
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Total de registros inconsistentes: $total**" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat detalhes.md >> "$GITHUB_STEP_SUMMARY"
